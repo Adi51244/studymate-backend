@@ -27,7 +27,7 @@ gemini_api_key = os.getenv("GEMINI_API_KEY")
 
 # Initialize services
 app = FastAPI(title="PDF Study Assistant API", version="1.0.0")
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 # CORS middleware
 app.add_middleware(
@@ -201,16 +201,15 @@ async def process_with_gemini_latest(prompt: str, text: str) -> str:
         raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    # If no credentials provided or Firebase Admin not available, use demo user
+    if credentials is None or firebase_app is None:
+        print("Production mode: Using demo user without authentication")
+        return {"uid": "demo_user", "email": "demo@studymate.com"}
+    
     token = credentials.credentials
+    
     try:
-        # Check if Firebase Admin is available
-        if firebase_app is None:
-            # In production without Firebase Admin SDK, we'll skip token verification
-            # This is a simplified approach for this demo
-            print("Skipping Firebase token verification - Admin SDK not available")
-            return {"uid": "demo_user", "email": "demo@example.com"}
-        
-        # Firebase Admin SDK verification with enhanced error handling
+        # Firebase Admin SDK verification with enhanced error handling (local only)
         decoded_token = auth.verify_id_token(token)
         return decoded_token
     except Exception as e:
@@ -228,9 +227,14 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
                 return decoded_token
             except Exception as retry_error:
                 print(f"Token verification failed on retry: {retry_error}")
+                # In production, fall back to demo user instead of failing
+                if firebase_app is None:
+                    return {"uid": "demo_user", "email": "demo@studymate.com"}
                 raise HTTPException(status_code=401, detail=f"Invalid token: {retry_error}")
         else:
-            # For other errors, fail immediately
+            # For other errors, fall back to demo user in production
+            if firebase_app is None:
+                return {"uid": "demo_user", "email": "demo@studymate.com"}
             raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 # API Routes
