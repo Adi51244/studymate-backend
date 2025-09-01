@@ -46,8 +46,18 @@ genai.configure(api_key=gemini_api_key)
 
 # Firebase Admin initialization
 try:
-    firebase_admin.initialize_app(credentials.Certificate("firebase-service-account.json"))
-    print("Firebase Admin initialized successfully")
+    # Try to initialize with service account file (local development)
+    if os.path.exists("firebase-service-account.json"):
+        firebase_admin.initialize_app(credentials.Certificate("firebase-service-account.json"))
+        print("Firebase Admin initialized with service account file")
+    else:
+        # Use environment variables for production (Render)
+        firebase_project_id = os.getenv('FIREBASE_PROJECT_ID')
+        if firebase_project_id:
+            firebase_admin.initialize_app(options={'projectId': firebase_project_id})
+            print("Firebase Admin initialized with project ID")
+        else:
+            print("Warning: Firebase not initialized - missing configuration")
 except Exception as e:
     print(f"Firebase initialization error: {e}")
 
