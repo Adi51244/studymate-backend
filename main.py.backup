@@ -1,0 +1,635 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials        raise HTTPException(status_code=500, detail=f"AI processing failed: {e}")import os
+import          raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")     print(f"Error type: {type(e)}")
+        raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")       raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")empfile
+import google.generativeai as genai
+from supabase import create_client, Client
+import fitz  # PyMuPDF
+import pdfplumber
+from pydantic import BaseModel
+from typing import List, Optional
+import firebase_admin
+from firebase_admin import credentials, auth
+from dotenv import load_dotenv
+import aiofiles
+import asyncio
+from datetime import datetime
+import requests
+
+# Load environment variables
+load_dotenv()
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="PDF Study Assistant API",
+    description="AI-powered PDF processing for students and professionals",
+    version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure properly for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Firebase Admin (for token verification)
+try:
+    if not firebase_admin._apps:
+        # Initialize with service account credentials
+        cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "firebase-service-account.json")
+        if os.path.exists(cred_path):
+            cred = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred)
+            print("Firebase Admin initialized successfully")
+        else:
+            print(f"Firebase service account file not found at: {cred_path}")
+except Exception as e:
+    print(f"Firebase initialization error: {e}")
+
+# Initialize Supabase
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_ANON_KEY")
+supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
+
+# Initialize Google Gemini
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+if gemini_api_key:
+    genai.configure(api_key=gemini_api_key)
+
+# Security
+security = HTTPBearer()
+
+# In-memory storage for uploaded files (for testing/demo purposes)
+uploaded_files = {}
+
+# Pydantic models
+class PDFUploadResponse(BaseModel):
+    file_id: str
+    file_url: str
+    filename: str
+    size: int
+
+class QuestionRequest(BaseModel):
+    file_id: str
+    question: str
+
+class SummarizeRequest(BaseModel):
+    file_id: str
+    summary_type: str = "brief"  # brief, detailed, bullet_points
+
+class QuizRequest(BaseModel):
+    file_id: str
+    num_questions: int = 5
+    difficulty: str = "medium"  # easy, medium, hard
+
+class FlashcardsRequest(BaseModel):
+    file_id: str
+    num_cards: int = 10
+
+class QuizQuestion(BaseModel):
+    question: str
+    options: List[str]
+    correct_answer: int
+    explanation: str
+
+class Flashcard(BaseModel):
+    front: str
+    back: str
+
+class ProcessingResponse(BaseModel):
+    status: str
+    result: Optional[str] = None
+    data: Optional[List] = None
+
+# Authentication dependency
+# Helper function to get file content
+async def get_file_content(file_id: str) -> bytes:
+    """Get file content from either in-memory storage or Supabase"""
+    print(f"Getting file content for: {file_id}")
+    
+    # Check if file exists in memory first
+    if file_id in uploaded_files:
+        print(f"File found in memory: {file_id}")
+        file_info = uploaded_files[file_id]
+        file_url = file_info['file_url']
+        
+        # Download from public URL with better error handling
+        try:
+            response = requests.get(file_url, timeout=30)
+            print(f"HTTP response status: {response.status_code}")
+            if response.status_code == 200:
+                print(f"Downloaded file from URL, size: {len(response.content)} bytes")
+                return response.content
+            else:
+                print(f"Failed to download from URL: {response.status_code}, Response: {response.text[:200]}")
+                raise HTTPException(status_code=500, detail=f"Cannot download file from URL. HTTP {response.status_code}. Check Supabase bucket policies - you may need to enable public read access for the 'pdfs' bucket.")
+        except requests.exceptions.RequestException as req_error:
+            print(f"Request failed: {req_error}")
+            raise HTTPException(status_code=500, detail=f"Network error downloading file: {req_error}")
+    else:
+        # Try to download from Supabase storage directly
+        try:
+            print(f"Downloading from Supabase storage: {file_id}")
+            file_data = supabase.storage.from_("pdfs").download(file_id)
+            print(f"Downloaded from Supabase, size: {len(file_data)} bytes")
+            return file_data
+        except Exception as download_error:
+            print(f"Supabase download failed: {download_error}")
+            raise HTTPException(status_code=500, detail=f"Supabase storage error: {download_error}. Check bucket policies and file permissions.")
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        # Handle demo user token
+        if token == "demo-token" or "demo" in token.lower():
+            return {"uid": "demo-user", "email": "demo@example.com", "name": "Demo User"}
+        
+        # Verify Firebase JWT token
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token
+    except Exception as e:
+        print(f"Token verification error: {e}")
+        # For development, allow any token that contains "demo"
+        if "demo" in token.lower():
+            return {"uid": "demo-user", "email": "demo@example.com", "name": "Demo User"}
+        raise HTTPException(status_code=401, detail=f"Invalid authentication token: {str(e)}")
+
+# Utility functions
+def extract_text_from_pdf(file_path: str) -> str:
+    """Extract text from PDF using PyMuPDF"""
+    try:
+        doc = fitz.open(file_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        return text
+    except Exception as e:
+        # Fallback to pdfplumber
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                text = ""
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+                return text
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Failed to extract text from PDF: {e2}")
+
+async def process_with_gemini(prompt: str, text: str) -> str:
+    """Process text with Google Gemini AI"""
+    try:
+        model = genai.GenerativeModel('gemini-pro')
+        full_prompt = f"{prompt}\n\nDocument Content:\n{text[:10000]}"
+        response = model.generate_content(full_prompt)
+        return response.text
+    except Exception as e:
+        print(f"AI error: {e}")
+        raise HTTPException(status_code=500, detail=f"AI processing failed: {e}"))
+
+# API Routes
+
+@app.get("/")
+async def root():
+    return {"message": "PDF Study Assistant API", "version": "1.0.0"}
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "services": {
+            "supabase": bool(supabase),
+            "gemini": bool(gemini_api_key),
+            "firebase": bool(firebase_admin._apps)
+        }
+    }
+
+@app.post("/upload-test")
+async def upload_test(file: UploadFile = File(...)):
+    """Test upload endpoint without authentication for debugging"""
+    try:
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+        
+        content = await file.read()
+        
+        return {
+            "status": "success",
+            "message": "File upload test successful",
+            "filename": file.filename,
+            "size": len(content),
+            "content_type": file.content_type
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload test failed: {e}")
+
+@app.post("/upload", response_model=PDFUploadResponse)
+async def upload_pdf(
+    file: UploadFile = File(...),
+    user = Depends(verify_token)
+):
+    """Upload PDF to Supabase storage"""
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Storage service not configured")
+    
+    try:
+        # Read file content and ensure it's bytes
+        content = await file.read()
+        if not isinstance(content, bytes):
+            raise HTTPException(status_code=400, detail="Invalid file content format")
+        
+        # Upload to Supabase storage with duplicate handling
+        file_path = f"user_uploads/{user['uid']}/{file.filename}"
+        
+        print(f"Authenticated upload - File: {file.filename}, User: {user['uid']}, Size: {len(content)} bytes")
+        
+        # Handle duplicate files by removing existing and uploading new
+        try:
+            # First try to remove existing file if it exists
+            try:
+                remove_result = supabase.storage.from_("pdfs").remove([file_path])
+                print(f"Removed existing user file: {remove_result}")
+            except Exception as remove_error:
+                print(f"User file doesn't exist or remove failed: {remove_error}")
+            
+            # Now upload the new file
+            result = supabase.storage.from_("pdfs").upload(file_path, content)
+            print(f"Authenticated upload successful: {result}")
+            
+        except Exception as upload_error:
+            print(f"Authenticated upload exception: {upload_error}")
+            # If still fails, try with upsert
+            try:
+                result = supabase.storage.from_("pdfs").upload(
+                    file_path, 
+                    content,
+                    file_options={"upsert": True}
+                )
+                print(f"Authenticated upsert upload successful: {result}")
+            except Exception as retry_error:
+                print(f"Authenticated retry upload failed: {retry_error}")
+                raise HTTPException(status_code=500, detail=f"Upload failed: {str(retry_error)}")
+        
+        # Get public URL
+        try:
+            file_url_response = supabase.storage.from_("pdfs").get_public_url(file_path)
+            # Handle different response formats
+            if isinstance(file_url_response, dict):
+                file_url = file_url_response.get('publicUrl') or file_url_response.get('url')
+            elif hasattr(file_url_response, 'publicUrl'):
+                file_url = file_url_response.publicUrl
+            else:
+                file_url = str(file_url_response)
+                
+        except Exception as url_error:
+            print(f"URL generation error: {url_error}")
+            file_url = f"https://{supabase.url}/storage/v1/object/public/pdfs/{file_path}"
+        
+        return PDFUploadResponse(
+            file_id=file_path,
+            file_url=file_url,
+            filename=file.filename,
+            size=len(content)
+        )
+    except Exception as e:
+        print(f"Upload error details: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.post("/test-upload")
+async def test_upload_pdf(file: UploadFile = File(...)):
+    """Test upload without authentication"""
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Storage service not configured")
+    
+    try:
+        # Read file content and ensure it's bytes
+        content = await file.read()
+        if not isinstance(content, bytes):
+            raise HTTPException(status_code=400, detail="Invalid file content format")
+        
+        # Upload to Supabase storage
+        file_path = f"test_uploads/{file.filename}"
+        
+        print(f"Uploading file: {file.filename}, size: {len(content)} bytes")
+        
+        # Strategy: Always use the file if it exists, or upload new one
+        file_url = None
+        file_exists = False
+        
+        # First, check if file already exists by trying to get its URL
+        try:
+            file_url_response = supabase.storage.from_("pdfs").get_public_url(file_path)
+            if isinstance(file_url_response, dict):
+                file_url = file_url_response.get('publicUrl') or file_url_response.get('url')
+            elif hasattr(file_url_response, 'publicUrl'):
+                file_url = file_url_response.publicUrl
+            else:
+                file_url = str(file_url_response)
+            
+            # If we got a URL, assume file exists
+            if file_url:
+                file_exists = True
+                print(f"File already exists, using existing: {file_url}")
+        except Exception as check_error:
+            print(f"File doesn't exist, will upload new: {check_error}")
+            file_exists = False
+        
+        # If file doesn't exist, upload it
+        if not file_exists:
+            try:
+                # Simple upload without upsert first
+                result = supabase.storage.from_("pdfs").upload(file_path, content)
+                print(f"New upload successful: {result}")
+                
+                # Get URL after successful upload
+                file_url_response = supabase.storage.from_("pdfs").get_public_url(file_path)
+                if isinstance(file_url_response, dict):
+                    file_url = file_url_response.get('publicUrl') or file_url_response.get('url')
+                elif hasattr(file_url_response, 'publicUrl'):
+                    file_url = file_url_response.publicUrl
+                else:
+                    file_url = str(file_url_response)
+                    
+            except Exception as upload_error:
+                print(f"Upload failed, file might exist: {upload_error}")
+                # If upload failed, try to get URL anyway (file might exist)
+                try:
+                    file_url_response = supabase.storage.from_("pdfs").get_public_url(file_path)
+                    if isinstance(file_url_response, dict):
+                        file_url = file_url_response.get('publicUrl') or file_url_response.get('url')
+                    elif hasattr(file_url_response, 'publicUrl'):
+                        file_url = file_url_response.publicUrl
+                    else:
+                        file_url = str(file_url_response)
+                    print(f"Using existing file URL: {file_url}")
+                except Exception as final_error:
+                    print(f"Final error getting URL: {final_error}")
+                    raise HTTPException(status_code=500, detail=f"Upload and URL retrieval failed: {str(final_error)}")
+        
+        # Store file info in memory for demo purposes
+        uploaded_files[file_path] = {
+            "file_id": file_path,
+            "filename": file.filename,
+            "file_url": file_url,
+            "size": len(content),
+            "uploaded_at": datetime.now().isoformat(),
+            "user_id": "test_user"  # For test uploads
+        }
+        
+        return {
+            "status": "success",
+            "message": "File available for processing" + (" (existing)" if file_exists else " (newly uploaded)"),
+            "file_id": file_path,
+            "file_url": file_url,
+            "filename": file.filename,
+            "size": len(content)
+        }
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"Test upload error details: {e}")
+        print(f"Error type: {type(e)}")
+        raise HTTPException(status_code=500, detail=f"Test upload failed: {str(e)}")
+
+@app.get("/pdfs")
+async def list_user_pdfs(user = Depends(verify_token)):
+    """List all PDFs uploaded by the current user"""
+    try:
+        # Check both Supabase storage and in-memory storage
+        user_folder = f"user_uploads/{user['uid']}"
+        user_pdfs = []
+        
+        # Get from in-memory storage first (for test uploads that might be relevant)
+        for file_path, file_info in uploaded_files.items():
+            if file_info.get('user_id') == user['uid'] or file_path.startswith('test_uploads/'):
+                user_pdfs.append({
+                    "file_id": file_info["file_id"],
+                    "filename": file_info["filename"],
+                    "file_url": file_info["file_url"],
+                    "size": file_info["size"],
+                    "uploaded_at": file_info["uploaded_at"]
+                })
+        
+        # Also get list of files from Supabase storage
+        try:
+            files_result = supabase.storage.from_("pdfs").list(user_folder)
+            
+            if files_result and isinstance(files_result, list):
+                for file_obj in files_result:
+                    if isinstance(file_obj, dict) and file_obj.get('name', '').endswith('.pdf'):
+                        file_path = f"{user_folder}/{file_obj['name']}"
+                        file_url = supabase.storage.from_("pdfs").get_public_url(file_path)
+                        
+                        # Check if already in memory
+                        if not any(pdf['file_id'] == file_path for pdf in user_pdfs):
+                            user_pdfs.append({
+                                "file_id": file_path,
+                                "filename": file_obj['name'],
+                                "file_url": str(file_url),
+                                "size": file_obj.get('metadata', {}).get('size', 0),
+                                "uploaded_at": file_obj.get('created_at', datetime.now().isoformat())
+                            })
+        except Exception as storage_error:
+            print(f"Storage list error: {storage_error}")
+            # Continue with in-memory files only
+        
+        return {
+            "status": "success",
+            "data": {
+                "count": len(user_pdfs),
+                "pdfs": user_pdfs
+            }
+        }
+        
+        if not files_result:
+            return {"pdfs": [], "count": 0}
+        
+        pdfs = []
+        for file_info in files_result:
+            if file_info.get('name', '').endswith('.pdf'):
+                file_path = f"{user_folder}/{file_info['name']}"
+                file_url = supabase.storage.from_("pdfs").get_public_url(file_path)
+                
+                pdfs.append({
+                    "file_id": file_path,
+                    "filename": file_info['name'],
+                    "file_url": file_url,
+                    "size": file_info.get('metadata', {}).get('size', 0),
+                    "uploaded_at": file_info.get('created_at', ''),
+                    "updated_at": file_info.get('updated_at', '')
+                })
+        
+        return {
+            "pdfs": pdfs,
+            "count": len(pdfs)
+        }
+        
+    except Exception as e:
+        print(f"Error listing PDFs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list PDFs: {str(e)}")
+
+@app.post("/summarize", response_model=ProcessingResponse)
+async def summarize_pdf(
+    request: SummarizeRequest,
+    user = Depends(verify_token)
+):
+    """Generate summary of PDF content"""
+    try:
+        print(f"Summarizing PDF: {request.file_id}")
+        
+        # Get file content using helper function
+        file_content = await get_file_content(request.file_id)
+        
+        # Save temporarily for processing
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file_content)
+            tmp_file_path = tmp_file.name
+        
+        # Extract text
+        text = extract_text_from_pdf(tmp_file_path)
+        
+        # Clean up
+        os.unlink(tmp_file_path)
+        
+        # Generate summary with AI
+        prompts = {
+            "brief": "Provide a brief summary (2-3 paragraphs) of this document:",
+            "detailed": "Provide a detailed summary with key points and main topics:",
+            "bullet_points": "Summarize this document as bullet points with main topics:"
+        }
+        
+        prompt = prompts.get(request.summary_type, prompts["brief"])
+        summary = await process_with_gemini(prompt, text)
+        
+        return ProcessingResponse(status="success", result=summary)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Summarization failed: {e}")
+
+@app.post("/ask", response_model=ProcessingResponse)
+async def ask_question(
+    request: QuestionRequest,
+    user = Depends(verify_token)
+):
+    """Ask a question about the PDF content"""
+    try:
+        print(f"Asking question about PDF: {request.file_id}")
+        
+        # Get file content using helper function
+        file_content = await get_file_content(request.file_id)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file_content)
+            tmp_file_path = tmp_file.name
+        
+        text = extract_text_from_pdf(tmp_file_path)
+        os.unlink(tmp_file_path)
+        
+        # Generate answer with AI
+        prompt = f"Based on the document content, answer this question: {request.question}"
+        answer = await process_with_gemini(prompt, text)
+        
+        return ProcessingResponse(status="success", result=answer)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Question processing failed: {e}")
+
+@app.post("/quiz", response_model=ProcessingResponse)
+async def generate_quiz(
+    request: QuizRequest,
+    user = Depends(verify_token)
+):
+    """Generate quiz questions from PDF content"""
+    try:
+        print(f"Generating quiz for PDF: {request.file_id}")
+        
+        # Get file content using helper function
+        file_content = await get_file_content(request.file_id)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file_content)
+            tmp_file_path = tmp_file.name
+        
+        text = extract_text_from_pdf(tmp_file_path)
+        os.unlink(tmp_file_path)
+        
+        # Generate quiz with AI
+        prompt = f"""
+        Create {request.num_questions} multiple choice questions based on this document.
+        Difficulty level: {request.difficulty}
+        
+        Format each question as:
+        Q: [Question]
+        A) [Option 1]
+        B) [Option 2] 
+        C) [Option 3]
+        D) [Option 4]
+        Correct: [Letter]
+        Explanation: [Brief explanation]
+        
+        ---
+        """
+        
+        quiz_content = await process_with_gemini(prompt, text)
+        
+        return ProcessingResponse(status="success", result=quiz_content)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Quiz generation failed: {e}")
+
+@app.post("/flashcards", response_model=ProcessingResponse)
+async def generate_flashcards(
+    request: FlashcardsRequest,
+    user = Depends(verify_token)
+):
+    """Generate flashcards from PDF content"""
+    try:
+        print(f"Generating flashcards for PDF: {request.file_id}")
+        
+        # Get file content using helper function
+        file_content = await get_file_content(request.file_id)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file_content)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file_content)
+            tmp_file_path = tmp_file.name
+        
+        text = extract_text_from_pdf(tmp_file_path)
+        os.unlink(tmp_file_path)
+        
+        # Generate flashcards with AI
+        prompt = f"""
+        Create {request.num_cards} flashcards based on this document.
+        
+        Format each flashcard as:
+        FRONT: [Question or term]
+        BACK: [Answer or definition]
+        
+        ---
+        """
+        
+        flashcards_content = await process_with_gemini(prompt, text)
+        
+        return ProcessingResponse(status="success", result=flashcards_content)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Flashcard generation failed: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
