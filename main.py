@@ -5,7 +5,7 @@ import os
 import tempfile
 import google.generativeai as genai
 from supabase import create_client, Client
-import fitz  # PyMuPDF
+# import fitz  # PyMuPDF - Commented out for cloud deployment
 import pdfplumber
 from pydantic import BaseModel
 from typing import List, Optional
@@ -92,31 +92,24 @@ class FlashcardsRequest(BaseModel):
 
 # Helper functions
 def extract_text_from_pdf(file_path: str) -> str:
-    """Extract text from PDF using multiple methods"""
+    """Extract text from PDF using pdfplumber"""
     text = ""
     
     try:
-        # Try PyMuPDF first
-        doc = fitz.open(file_path)
-        for page in doc:
-            text += page.get_text()
-        doc.close()
+        # Use pdfplumber for cloud deployment compatibility
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
         
         if text.strip():
             return text
-    except Exception as e1:
-        print(f"PyMuPDF failed: {e1}")
-        
-        try:
-            # Fallback to pdfplumber
-            with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text
-                return text
-        except Exception as e2:
-            raise HTTPException(status_code=500, detail=f"Failed to extract text from PDF: {e2}")
+    except Exception as e:
+        print(f"PDF extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract text from PDF: {str(e)}")
+    
+    return text
 
 async def get_file_content(file_id: str) -> bytes:
     """Get file content from either in-memory storage or Supabase"""
