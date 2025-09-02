@@ -199,57 +199,30 @@ async def process_with_gemini_latest(prompt: str, text: str) -> str:
         raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    # If no credentials provided, return anonymous user
-    if credentials is None:
-        print('No credentials provided: Using anonymous user')
-        return {'uid': 'anonymous_user', 'email': 'anonymous@studymate.com'}
-    
     token = credentials.credentials
-    
-    # Import auth helper for production
     try:
-        from auth_helper import get_user_from_token
-        # Check if Firebase Admin is available
-        firebase_available = False
-        try:
-            firebase_available = bool(firebase_admin._apps)
-        except:
-            firebase_available = False
-        
-        if not firebase_available:
-            # Use production auth helper
-            return get_user_from_token(token, firebase_available=False)
-    except ImportError:
-        print('auth_helper not available, using fallback')
-    
-    try:
-        # Firebase Admin SDK verification (local development only)
+        # Firebase Admin SDK verification with enhanced error handling
         decoded_token = auth.verify_id_token(token)
         return decoded_token
     except Exception as e:
         error_str = str(e)
-        print(f'Token verification error: {e}')
+        print(f"Token verification error: {e}")
         
         # Handle specific timing errors with a simple retry
-        if 'Token used too early' in error_str or 'Check that your computer' in error_str:
+        if "Token used too early" in error_str or "Check that your computer's clock is set correctly" in error_str:
             try:
                 # Simple retry for timing issues
                 import time
                 time.sleep(1)
                 decoded_token = auth.verify_id_token(token)
-                print('Token verification succeeded on retry')
+                print("Token verification succeeded on retry")
                 return decoded_token
             except Exception as retry_error:
-                print(f'Token verification failed on retry: {retry_error}')
-                # Create fallback user from token hash
-                import hashlib
-                user_hash = hashlib.md5(token.encode()).hexdigest()[:8]
-                return {'uid': f'user_{user_hash}', 'email': f'user_{user_hash}@studymate.com'}
+                print(f"Token verification failed on retry: {retry_error}")
+                raise HTTPException(status_code=401, detail=f"Invalid token: {retry_error}")
         else:
-            # For other errors, create fallback user
-            import hashlib
-            user_hash = hashlib.md5(token.encode()).hexdigest()[:8]
-            return {'uid': f'user_{user_hash}', 'email': f'user_{user_hash}@studymate.com'}
+            # For other errors, fail immediately
+            raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 # API Routes
 @app.get("/")
