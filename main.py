@@ -5,7 +5,7 @@ import os
 import tempfile
 import google.generativeai as genai
 from supabase import create_client, Client
-# import fitz  # PyMuPDF - Commented out for cloud deployment
+import fitz  # PyMuPDF
 import pdfplumber
 from pydantic import BaseModel
 from typing import List, Optional
@@ -27,7 +27,7 @@ gemini_api_key = os.getenv("GEMINI_API_KEY")
 
 # Initialize services
 app = FastAPI(title="PDF Study Assistant API", version="1.0.0")
-security = HTTPBearer(auto_error=False)
+security = HTTPBearer()
 
 # CORS middleware
 app.add_middleware(
@@ -45,20 +45,11 @@ supabase: Client = create_client(supabase_url, supabase_anon_key)
 genai.configure(api_key=gemini_api_key)
 
 # Firebase Admin initialization
-firebase_app = None
 try:
-    # Try to initialize with service account file (local development)
-    if os.path.exists("firebase-service-account.json"):
-        firebase_app = firebase_admin.initialize_app(credentials.Certificate("firebase-service-account.json"))
-        print("Firebase Admin initialized with service account file")
-    else:
-        # For production, skip Firebase Admin initialization
-        # We'll handle token verification differently
-        print("Firebase Admin not initialized - running in production mode without admin SDK")
-        firebase_app = None
+    firebase_admin.initialize_app(credentials.Certificate("firebase-service-account.json"))
+    print("Firebase Admin initialized successfully")
 except Exception as e:
     print(f"Firebase initialization error: {e}")
-    firebase_app = None
 
 # In-memory storage for uploaded files
 uploaded_files = {}
@@ -101,24 +92,31 @@ class FlashcardsRequest(BaseModel):
 
 # Helper functions
 def extract_text_from_pdf(file_path: str) -> str:
-    """Extract text from PDF using pdfplumber"""
+    """Extract text from PDF using multiple methods"""
     text = ""
     
     try:
-        # Use pdfplumber for cloud deployment compatibility
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
+        # Try PyMuPDF first
+        doc = fitz.open(file_path)
+        for page in doc:
+            text += page.get_text()
+        doc.close()
         
         if text.strip():
             return text
-    except Exception as e:
-        print(f"PDF extraction failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to extract text from PDF: {str(e)}")
-    
-    return text
+    except Exception as e1:
+        print(f"PyMuPDF failed: {e1}")
+        
+        try:
+            # Fallback to pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text
+                return text
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Failed to extract text from PDF: {e2}")
 
 async def get_file_content(file_id: str) -> bytes:
     """Get file content from either in-memory storage or Supabase"""
@@ -201,15 +199,9 @@ async def process_with_gemini_latest(prompt: str, text: str) -> str:
         raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    # If no credentials provided or Firebase Admin not available, use demo user
-    if credentials is None or firebase_app is None:
-        print("Production mode: Using demo user without authentication")
-        return {"uid": "demo_user", "email": "demo@studymate.com"}
-    
     token = credentials.credentials
-    
     try:
-        # Firebase Admin SDK verification with enhanced error handling (local only)
+        # Firebase Admin SDK verification with enhanced error handling
         decoded_token = auth.verify_id_token(token)
         return decoded_token
     except Exception as e:
@@ -227,14 +219,9 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
                 return decoded_token
             except Exception as retry_error:
                 print(f"Token verification failed on retry: {retry_error}")
-                # In production, fall back to demo user instead of failing
-                if firebase_app is None:
-                    return {"uid": "demo_user", "email": "demo@studymate.com"}
                 raise HTTPException(status_code=401, detail=f"Invalid token: {retry_error}")
         else:
-            # For other errors, fall back to demo user in production
-            if firebase_app is None:
-                return {"uid": "demo_user", "email": "demo@studymate.com"}
+            # For other errors, fail immediately
             raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 # API Routes
@@ -249,7 +236,7 @@ async def health_check():
         "services": {
             "supabase": bool(supabase),
             "gemini": bool(gemini_api_key),
-            "firebase": firebase_app is not None
+            "firebase": bool(firebase_admin._apps)
         },
         "ai_model": "gemini-2.5-pro"
     }
