@@ -58,11 +58,19 @@ class RateLimiter:
 gemini_pro_rate_limiter = RateLimiter(max_requests_per_minute=2)
 gemini_flash_rate_limiter = RateLimiter(max_requests_per_minute=15)
 
-# Configuration
-supabase_url = os.getenv("SUPABASE_URL")
-supabase_anon_key = os.getenv("SUPABASE_ANON_KEY")
-supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-gemini_api_key = os.getenv("GEMINI_API_KEY")
+# Configuration with validation
+def get_required_env_var(var_name: str) -> str:
+    """Get required environment variable or raise helpful error"""
+    value = os.getenv(var_name)
+    if not value:
+        raise ValueError(f"Missing required environment variable: {var_name}")
+    return value
+
+# Get required environment variables
+supabase_url = get_required_env_var("SUPABASE_URL")
+supabase_anon_key = get_required_env_var("SUPABASE_ANON_KEY")
+supabase_service_role_key = get_required_env_var("SUPABASE_SERVICE_ROLE_KEY")
+gemini_api_key = get_required_env_var("GEMINI_API_KEY")
 
 # Initialize services
 app = FastAPI(title="PDF Study Assistant API", version="1.0.0")
@@ -77,12 +85,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Supabase clients
-supabase: Client = create_client(supabase_url, supabase_anon_key)
-supabase_admin: Client = create_client(supabase_url, supabase_service_role_key)
+# Initialize Supabase clients with error handling
+try:
+    supabase: Client = create_client(supabase_url, supabase_anon_key)
+    supabase_admin: Client = create_client(supabase_url, supabase_service_role_key)
+    print(f"Supabase clients initialized successfully for URL: {supabase_url}")
+except Exception as e:
+    print(f"Failed to initialize Supabase clients: {e}")
+    raise
 
-# Initialize Gemini AI
-genai.configure(api_key=gemini_api_key)
+# Initialize Gemini AI with validation
+try:
+    genai.configure(api_key=gemini_api_key)
+    print("Gemini AI configured successfully")
+except Exception as e:
+    print(f"Failed to configure Gemini AI: {e}")
+    raise
 
 # Firebase Admin initialization
 firebase_app = None
