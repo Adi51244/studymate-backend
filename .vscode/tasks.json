@@ -1,0 +1,41 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start Backend Server Port 8001 Python311",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"uvicorn",
+				"main:app",
+				"--reload",
+				"--host",
+				"0.0.0.0",
+				"--port",
+				"8001"
+			],
+			"isBackground": true,
+			"group": "build"
+		},
+		{
+			"label": "Backend Port 8001",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"uvicorn",
+				"main:app",
+				"--reload",
+				"--host",
+				"0.0.0.0",
+				"--port",
+				"8001"
+			],
+			"isBackground": true,
+			"group": "build"
+		}
+	]
+}
