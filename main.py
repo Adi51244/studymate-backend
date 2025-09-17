@@ -3,9 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 import tempfile
+import random
+import datetime
 import google.generativeai as genai
 from supabase import create_client, Client
-import fitz  # PyMuPDF
+# import fitz  # PyMuPDF - Commented out for cloud deployment
 import pdfplumber
 from pydantic import BaseModel
 from typing import List, Optional
@@ -16,18 +18,55 @@ import aiofiles
 import asyncio
 from datetime import datetime
 import requests
+import time
+from collections import defaultdict, deque
 
 # Load environment variables
 load_dotenv()
 
+# Rate limiter for Gemini API
+class RateLimiter:
+    def __init__(self, max_requests_per_minute=2):
+        self.max_requests = max_requests_per_minute
+        self.requests = deque()
+    
+    async def wait_if_needed(self):
+        now = time.time()
+        
+        # Remove requests older than 1 minute
+        while self.requests and self.requests[0] < now - 60:
+            self.requests.popleft()
+        
+        # If we're at the limit, wait
+        if len(self.requests) >= self.max_requests:
+            wait_time = 60 - (now - self.requests[0]) + 1  # Add 1 second buffer
+            print(f"Rate limit reached. Waiting {wait_time:.1f} seconds...")
+            await asyncio.sleep(wait_time)
+            
+            # Clean up old requests after waiting
+            now = time.time()
+            while self.requests and self.requests[0] < now - 60:
+                self.requests.popleft()
+        
+        # Record this request
+        self.requests.append(now)
+
+# Initialize rate limiter
+# Create rate limiters for different models
+# Gemini 2.5 Pro free tier: 2 requests per minute
+# Gemini 1.5 Flash free tier: 15 requests per minute (more lenient fallback)
+gemini_pro_rate_limiter = RateLimiter(max_requests_per_minute=2)
+gemini_flash_rate_limiter = RateLimiter(max_requests_per_minute=15)
+
 # Configuration
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_anon_key = os.getenv("SUPABASE_ANON_KEY")
+supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 
 # Initialize services
 app = FastAPI(title="PDF Study Assistant API", version="1.0.0")
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 # CORS middleware
 app.add_middleware(
@@ -38,18 +77,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Supabase
+# Initialize Supabase clients
 supabase: Client = create_client(supabase_url, supabase_anon_key)
+supabase_admin: Client = create_client(supabase_url, supabase_service_role_key)
 
 # Initialize Gemini AI
 genai.configure(api_key=gemini_api_key)
 
 # Firebase Admin initialization
+firebase_app = None
 try:
-    firebase_admin.initialize_app(credentials.Certificate("firebase-service-account.json"))
-    print("Firebase Admin initialized successfully")
+    # Try to initialize with service account file (local development)
+    if os.path.exists("firebase-service-account.json"):
+        firebase_app = firebase_admin.initialize_app(credentials.Certificate("firebase-service-account.json"))
+        print("Firebase Admin initialized with service account file")
+    else:
+        # For production, skip Firebase Admin initialization
+        # We'll handle token verification differently
+        print("Firebase Admin not initialized - running in production mode without admin SDK")
+        firebase_app = None
 except Exception as e:
     print(f"Firebase initialization error: {e}")
+    firebase_app = None
 
 # In-memory storage for uploaded files
 uploaded_files = {}
@@ -91,36 +140,41 @@ class FlashcardsRequest(BaseModel):
     num_cards: int = 10
 
 # Helper functions
+def validate_user_file_access(file_id: str, user_id: str) -> bool:
+    """Validate that the user has access to the specified file"""
+    expected_prefix = f"user_uploads/{user_id}/"
+    if not file_id.startswith(expected_prefix):
+        print(f"Access denied: File {file_id} does not belong to user {user_id}")
+        return False
+    return True
+
 def extract_text_from_pdf(file_path: str) -> str:
-    """Extract text from PDF using multiple methods"""
+    """Extract text from PDF using pdfplumber"""
     text = ""
     
     try:
-        # Try PyMuPDF first
-        doc = fitz.open(file_path)
-        for page in doc:
-            text += page.get_text()
-        doc.close()
+        # Use pdfplumber for cloud deployment compatibility
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
         
         if text.strip():
             return text
-    except Exception as e1:
-        print(f"PyMuPDF failed: {e1}")
-        
-        try:
-            # Fallback to pdfplumber
-            with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text
-                return text
-        except Exception as e2:
-            raise HTTPException(status_code=500, detail=f"Failed to extract text from PDF: {e2}")
+    except Exception as e:
+        print(f"PDF extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract text from PDF: {str(e)}")
+    
+    return text
 
-async def get_file_content(file_id: str) -> bytes:
-    """Get file content from either in-memory storage or Supabase"""
+async def get_file_content(file_id: str, user_id: str = None) -> bytes:
+    """Get file content from either in-memory storage or Supabase with user validation"""
     print(f"Getting file content for: {file_id}")
+    
+    # Validate user access if user_id provided
+    if user_id and not validate_user_file_access(file_id, user_id):
+        raise HTTPException(status_code=403, detail="Access denied: File does not belong to user")
     
     if file_id in uploaded_files:
         print(f"File found in memory: {file_id}")
@@ -149,19 +203,37 @@ async def get_file_content(file_id: str) -> bytes:
             raise HTTPException(status_code=500, detail=f"Supabase storage error: {download_error}")
 
 async def process_with_gemini_latest(prompt: str, text: str) -> str:
-    """Process text with latest Gemini 2.5 Pro model"""
+    """Process text with Gemini models with rate limiting and fallback"""
+    
+    # First try Gemini 2.5 Pro with rate limiting
     try:
         print(f"Starting Gemini 2.5 Pro processing...")
         print(f"Text length: {len(text)} characters")
         
-        # Change the model name here to use Gemini 2.5 Pro
-        model = genai.GenerativeModel('gemini-2.5-pro')
-
-        # NOTE: You can now pass the full text, as 2.5 Pro has a large context window.
-        # The chunking logic is no longer strictly necessary unless your files
-        # are truly enormous, exceeding 1 million tokens.
-        full_prompt = f"{prompt}\n\nDocument Content:\n{text}"
-        response = model.generate_content(full_prompt)
+        # Wait if we need to respect rate limits (use Pro limiter initially)
+        await gemini_pro_rate_limiter.wait_if_needed()
+        
+        try:
+            model = genai.GenerativeModel('gemini-2.5-pro')
+            full_prompt = f"{prompt}\n\nDocument Content:\n{text}"
+            response = model.generate_content(full_prompt)
+        except Exception as primary_error:
+            print(f"Gemini 2.5 Pro error: {primary_error}")
+            
+            # Check if it's a rate limit or quota error, fallback to gemini-1.5-flash
+            error_str = str(primary_error).lower()
+            if "quota" in error_str or "rate" in error_str or "429" in error_str:
+                print("Rate limit detected, falling back to gemini-1.5-flash...")
+                try:
+                    # Use the flash model rate limiter for fallback
+                    await gemini_flash_rate_limiter.wait_if_needed()
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    response = model.generate_content(full_prompt)
+                except Exception as fallback_error:
+                    print(f"Fallback model also failed: {fallback_error}")
+                    raise HTTPException(status_code=503, detail=f"Both AI models failed. Primary: {primary_error}, Fallback: {fallback_error}")
+            else:
+                raise HTTPException(status_code=500, detail=f"AI processing failed: {primary_error}")
         
         if response and response.text:
             result = response.text
@@ -195,61 +267,82 @@ async def process_with_gemini_latest(prompt: str, text: str) -> str:
             return "Empty response from AI"
         
     except Exception as e:
-        print(f"Gemini 2.5 Pro error: {e}")
+        print(f"Unexpected error in process_with_gemini_latest: {e}")
         raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    # If no credentials provided, return anonymous user
+    # Require authentication - no anonymous access
     if credentials is None:
-        print('No credentials provided: Using anonymous user')
-        return {'uid': 'anonymous_user', 'email': 'anonymous@studymate.com'}
+        print("No credentials provided - authentication required")
+        raise HTTPException(status_code=401, detail="Authentication required. Please provide a valid token.")
     
     token = credentials.credentials
     
-    # Import auth helper for production
-    try:
-        from auth_helper import get_user_from_token
-        # Check if Firebase Admin is available
-        firebase_available = False
+    # If Firebase Admin not available (production), try to decode token manually to get user ID
+    if firebase_app is None:
         try:
-            firebase_available = bool(firebase_admin._apps)
-        except:
-            firebase_available = False
-        
-        if not firebase_available:
-            # Use production auth helper
-            return get_user_from_token(token, firebase_available=False)
-    except ImportError:
-        print('auth_helper not available, using fallback')
+            # Simple JWT decode without verification to get user info
+            import base64
+            import json
+            
+            # JWT tokens have 3 parts separated by dots
+            parts = token.split('.')
+            if len(parts) != 3:
+                raise HTTPException(status_code=401, detail="Invalid token format")
+            
+            # Decode the payload (second part)
+            payload = parts[1]
+            # Add padding if needed
+            payload += '=' * (4 - len(payload) % 4)
+            decoded_payload = base64.urlsafe_b64decode(payload)
+            user_data = json.loads(decoded_payload)
+            
+            # Extract user ID and email from token - must be valid
+            user_id = user_data.get('user_id') or user_data.get('sub') or user_data.get('uid')
+            email = user_data.get('email')
+            
+            if not user_id:
+                print("No user ID found in token")
+                raise HTTPException(status_code=401, detail="Invalid token: missing user ID")
+            
+            if not email:
+                print("No email found in token")
+                email = f"user_{user_id}@studymate.com"  # Generate email if missing
+            
+            print(f"Production mode: Extracted user {user_id} ({email}) from token")
+            return {"uid": user_id, "email": email}
+            
+        except HTTPException:
+            raise
+        except Exception as decode_error:
+            print(f"Failed to decode token: {decode_error}")
+            raise HTTPException(status_code=401, detail=f"Invalid token: {decode_error}")
     
     try:
         # Firebase Admin SDK verification (local development only)
         decoded_token = auth.verify_id_token(token)
+        print(f"Firebase Admin: Verified user {decoded_token['uid']} ({decoded_token.get('email', 'no-email')})")
         return decoded_token
     except Exception as e:
         error_str = str(e)
-        print(f'Token verification error: {e}')
+        print(f"Token verification error: {e}")
         
         # Handle specific timing errors with a simple retry
-        if 'Token used too early' in error_str or 'Check that your computer' in error_str:
+        if "Token used too early" in error_str or "Check that your computer's clock is set correctly" in error_str:
             try:
                 # Simple retry for timing issues
                 import time
                 time.sleep(1)
                 decoded_token = auth.verify_id_token(token)
-                print('Token verification succeeded on retry')
+                print("Token verification succeeded on retry")
+                print(f"Firebase Admin (retry): Verified user {decoded_token['uid']} ({decoded_token.get('email', 'no-email')})")
                 return decoded_token
             except Exception as retry_error:
-                print(f'Token verification failed on retry: {retry_error}')
-                # Create fallback user from token hash
-                import hashlib
-                user_hash = hashlib.md5(token.encode()).hexdigest()[:8]
-                return {'uid': f'user_{user_hash}', 'email': f'user_{user_hash}@studymate.com'}
+                print(f"Token verification failed on retry: {retry_error}")
+                raise HTTPException(status_code=401, detail=f"Invalid token after retry: {retry_error}")
         else:
-            # For other errors, create fallback user
-            import hashlib
-            user_hash = hashlib.md5(token.encode()).hexdigest()[:8]
-            return {'uid': f'user_{user_hash}', 'email': f'user_{user_hash}@studymate.com'}
+            # For other errors, raise authentication error
+            raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 # API Routes
 @app.get("/")
@@ -263,7 +356,7 @@ async def health_check():
         "services": {
             "supabase": bool(supabase),
             "gemini": bool(gemini_api_key),
-            "firebase": bool(firebase_admin._apps)
+            "firebase": firebase_app is not None
         },
         "ai_model": "gemini-2.5-pro"
     }
@@ -515,6 +608,8 @@ async def get_profile(user = Depends(verify_token)):
         user_id = user['uid']
         user_email = user.get('email', 'Unknown')
         
+        print(f"Profile request for user: {user_id} ({user_email})")
+        
         # Count user's PDFs
         pdf_count = 0
         
@@ -544,6 +639,17 @@ async def get_profile(user = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get profile: {e}")
 
+@app.get("/debug/auth")
+async def debug_auth(user = Depends(verify_token)):
+    """Debug endpoint to check authentication status"""
+    return {
+        "authenticated": True,
+        "user_id": user['uid'],
+        "email": user.get('email', 'Unknown'),
+        "user_data": user,
+        "status": "Authentication working properly"
+    }
+
 @app.post("/summarize", response_model=ProcessingResponse)
 async def summarize_pdf(
     request: SummarizeRequest,
@@ -551,9 +657,14 @@ async def summarize_pdf(
 ):
     """Generate summary using Gemini 1.5 Flash"""
     try:
-        print(f"Summarizing PDF: {request.file_id}")
+        user_id = user['uid']
+        print(f"Summarizing PDF: {request.file_id} for user: {user_id}")
         
-        file_content = await get_file_content(request.file_id)
+        # Validate user has access to this file
+        if not validate_user_file_access(request.file_id, user_id):
+            raise HTTPException(status_code=403, detail="Access denied: You can only access your own files")
+        
+        file_content = await get_file_content(request.file_id, user_id)
         
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_file.write(file_content)
@@ -562,14 +673,56 @@ async def summarize_pdf(
         text = extract_text_from_pdf(tmp_file_path)
         os.unlink(tmp_file_path)
         
-        # Enhanced prompts for different summary types
-        prompts = {
-            "brief": "Create a concise 2-3 paragraph summary highlighting the main points and key takeaways:",
-            "detailed": "Provide a comprehensive summary with detailed analysis, key points, main arguments, and important details:",
-            "bullet_points": "Create a well-structured bullet-point summary with main topics, subtopics, and key details:"
+        # Create unique randomization elements for each summary generation
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        random_seed = random.randint(1000, 9999)
+        
+        # Randomization for summary styles and perspectives
+        summary_approaches = {
+            "brief": [
+                "Create a concise 2-3 paragraph summary highlighting the main points and key takeaways",
+                "Provide a brief overview focusing on the most important concepts and conclusions", 
+                "Summarize the essential information in 2-3 clear, well-structured paragraphs",
+                "Generate a compact summary emphasizing core themes and critical insights"
+            ],
+            "detailed": [
+                "Provide a comprehensive summary with detailed analysis, key points, main arguments, and important details",
+                "Create an in-depth summary covering all major topics, supporting evidence, and significant findings",
+                "Generate a thorough analysis with comprehensive coverage of main themes, supporting details, and implications",
+                "Develop a detailed summary that captures the full scope, methodology, and important conclusions"
+            ],
+            "bullet_points": [
+                "Create a well-structured bullet-point summary with main topics, subtopics, and key details",
+                "Generate an organized bullet-point breakdown of major concepts, themes, and supporting information",
+                "Develop a hierarchical bullet-point summary with clear categorization of important points",
+                "Provide a structured bullet-point analysis organized by themes and significance"
+            ]
         }
         
-        prompt = prompts.get(request.summary_type, prompts["brief"])
+        perspectives = [
+            "Focus on practical applications and real-world implications",
+            "Emphasize theoretical frameworks and conceptual understanding",
+            "Highlight key relationships and interconnections between ideas", 
+            "Prioritize the most significant findings and conclusions",
+            "Balance factual information with analytical insights"
+        ]
+        
+        # Randomly select approach and perspective
+        available_approaches = summary_approaches.get(request.summary_type, summary_approaches["brief"])
+        selected_approach = random.choice(available_approaches)
+        selected_perspective = random.choice(perspectives)
+        
+        prompt = f"""Generation ID: {current_time}_{random_seed}
+
+{selected_approach}.
+
+Additional guidance: {selected_perspective}
+
+Ensure this summary is unique by varying:
+- The specific aspects you emphasize
+- The way you structure and organize information  
+- The language and phrasing used
+- The examples or details you choose to highlight"""
         summary = await process_with_gemini_latest(prompt, text)
         
         return ProcessingResponse(status="success", result=summary)
@@ -585,9 +738,14 @@ async def ask_question(
 ):
     """Answer questions using Gemini 1.5 Flash"""
     try:
-        print(f"Processing question about PDF: {request.file_id}")
+        user_id = user['uid']
+        print(f"Processing question about PDF: {request.file_id} for user: {user_id}")
         
-        file_content = await get_file_content(request.file_id)
+        # Validate user has access to this file
+        if not validate_user_file_access(request.file_id, user_id):
+            raise HTTPException(status_code=403, detail="Access denied: You can only access your own files")
+        
+        file_content = await get_file_content(request.file_id, user_id)
         
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_file.write(file_content)
@@ -612,9 +770,14 @@ async def generate_quiz(
 ):
     """Generate quiz using Gemini 1.5 Flash"""
     try:
-        print(f"Generating quiz for PDF: {request.file_id}")
+        user_id = user['uid']
+        print(f"Generating quiz for PDF: {request.file_id} for user: {user_id}")
         
-        file_content = await get_file_content(request.file_id)
+        # Validate user has access to this file
+        if not validate_user_file_access(request.file_id, user_id):
+            raise HTTPException(status_code=403, detail="Access denied: You can only access your own files")
+        
+        file_content = await get_file_content(request.file_id, user_id)
         
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_file.write(file_content)
@@ -623,18 +786,76 @@ async def generate_quiz(
         text = extract_text_from_pdf(tmp_file_path)
         os.unlink(tmp_file_path)
         
-        prompt = f"""Create a {request.difficulty} difficulty quiz with {request.num_questions} multiple-choice questions based on the document content. 
-        Return ONLY valid JSON with this exact structure (no markdown, no code blocks):
-        {{
-          "questions": [
-            {{
-              "question": "Question text",
-              "options": ["A) Option 1", "B) Option 2", "C) Option 3", "D) Option 4"],
-              "correct_answer": "A",
-              "explanation": "Why this answer is correct"
-            }}
-          ]
-        }}"""
+        # Create unique randomization elements for each quiz generation
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        random_seed = random.randint(1000, 9999)
+        
+        # Randomization techniques to ensure unique quizzes
+        question_styles = [
+            "multiple-choice questions",
+            "multiple-choice questions with detailed analysis", 
+            "challenging multiple-choice questions",
+            "comprehensive multiple-choice questions",
+            "thought-provoking multiple-choice questions"
+        ]
+        
+        focus_areas = [
+            "key concepts and main ideas",
+            "important details and specific information", 
+            "critical thinking and analysis",
+            "practical applications and examples",
+            "fundamental principles and theories",
+            "cause and effect relationships",
+            "comparisons and contrasts",
+            "sequential processes and procedures"
+        ]
+        
+        question_approaches = [
+            "Focus on testing understanding of core concepts",
+            "Emphasize application of knowledge to new scenarios", 
+            "Test ability to analyze and synthesize information",
+            "Challenge comprehension of complex relationships",
+            "Evaluate memory of specific facts and details",
+            "Assess critical thinking and problem-solving skills"
+        ]
+        
+        # Randomly select elements for uniqueness
+        selected_style = random.choice(question_styles)
+        selected_focus = random.choice(focus_areas)
+        selected_approach = random.choice(question_approaches)
+        
+        # Add variety in question distribution
+        question_distribution_notes = [
+            "Vary the difficulty within the selected level",
+            "Include both factual recall and conceptual questions",
+            "Mix direct questions with scenario-based questions", 
+            "Balance broad concepts with specific details",
+            "Include questions that test different cognitive levels"
+        ]
+        selected_distribution = random.choice(question_distribution_notes)
+        
+        prompt = f"""Create a {request.difficulty} difficulty quiz with {request.num_questions} {selected_style} based on the document content.
+
+UNIQUENESS REQUIREMENTS:
+- Generation ID: {current_time}_{random_seed}
+- Focus on: {selected_focus}
+- Approach: {selected_approach}
+- Distribution: {selected_distribution}
+- Randomize question order and topics covered
+- Use different phrasings and perspectives for questions
+- Vary the types of incorrect options (common mistakes, close alternatives, obvious wrong answers)
+
+Return ONLY valid JSON with this exact structure (no markdown, no code blocks):
+{{
+  "questions": [
+    {{
+      "question": "Question text",
+      "options": ["A) Option 1", "B) Option 2", "C) Option 3", "D) Option 4"],
+      "correct_answer": "A",
+      "explanation": "Why this answer is correct"
+    }}
+  ]
+}}"""
         
         quiz = await process_with_gemini_latest(prompt, text)
         
@@ -651,9 +872,14 @@ async def generate_flashcards(
 ):
     """Generate flashcards using Gemini 1.5 Flash"""
     try:
-        print(f"Generating flashcards for PDF: {request.file_id}")
+        user_id = user['uid']
+        print(f"Generating flashcards for PDF: {request.file_id} for user: {user_id}")
         
-        file_content = await get_file_content(request.file_id)
+        # Validate user has access to this file
+        if not validate_user_file_access(request.file_id, user_id):
+            raise HTTPException(status_code=403, detail="Access denied: You can only access your own files")
+        
+        file_content = await get_file_content(request.file_id, user_id)
         
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_file.write(file_content)
@@ -662,18 +888,76 @@ async def generate_flashcards(
         text = extract_text_from_pdf(tmp_file_path)
         os.unlink(tmp_file_path)
         
-        prompt = f"""Create {request.num_cards} educational flashcards based on the document content.
-        Return ONLY valid JSON with this exact structure (no markdown, no code blocks):
-        {{
-          "flashcards": [
-            {{
-              "front": "Question or key term",
-              "back": "Answer or definition",
-              "category": "Topic category"
-            }}
-          ]
-        }}
-        Focus on key concepts, definitions, important facts, and main ideas."""
+        # Create unique randomization elements for each flashcard generation
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        random_seed = random.randint(1000, 9999)
+        
+        # Randomization techniques to ensure unique flashcards
+        card_styles = [
+            "concise and focused flashcards",
+            "detailed flashcards with comprehensive explanations",
+            "practical flashcards with real-world applications",
+            "analytical flashcards that promote deep thinking",
+            "memory-enhancing flashcards with mnemonics"
+        ]
+        
+        content_focuses = [
+            "key terms and definitions",
+            "important concepts and principles",
+            "cause-and-effect relationships", 
+            "processes and procedures",
+            "comparisons and contrasts",
+            "examples and case studies",
+            "historical facts and dates",
+            "formulas and calculations",
+            "theories and models",
+            "practical applications"
+        ]
+        
+        card_formats = [
+            "Question on front, detailed answer on back",
+            "Term on front, definition and example on back", 
+            "Concept on front, explanation and significance on back",
+            "Problem on front, solution and method on back",
+            "Fill-in-the-blank on front, complete answer on back"
+        ]
+        
+        organization_approaches = [
+            "Group by topics and themes",
+            "Order from basic to advanced concepts",
+            "Mix different types of information randomly",
+            "Focus on the most critical information first",
+            "Balance factual recall with conceptual understanding"
+        ]
+        
+        # Randomly select elements for uniqueness
+        selected_style = random.choice(card_styles)
+        selected_focus = random.choice(content_focuses)
+        selected_format = random.choice(card_formats)
+        selected_organization = random.choice(organization_approaches)
+        
+        prompt = f"""Create {request.num_cards} educational {selected_style} based on the document content.
+
+UNIQUENESS REQUIREMENTS:
+- Generation ID: {current_time}_{random_seed}
+- Primary focus: {selected_focus}
+- Card format: {selected_format}
+- Organization: {selected_organization}
+- Vary the complexity and depth of cards
+- Use different perspectives and angles for the same topics
+- Include a mix of difficulty levels within the set
+- Randomize which aspects of concepts are highlighted
+
+Return ONLY valid JSON with this exact structure (no markdown, no code blocks):
+{{
+  "flashcards": [
+    {{
+      "front": "Question or key term",
+      "back": "Answer or definition", 
+      "category": "Topic category"
+    }}
+  ]
+}}"""
         
         flashcards = await process_with_gemini_latest(prompt, text)
         
@@ -695,24 +979,47 @@ async def delete_pdf(pdf_id: str, user = Depends(verify_token)):
         
         print(f"Delete request for file: {file_path}")
         print(f"User ID: {user_id}")
+        print(f"Using service role for deletion: {bool(supabase_service_role_key)}")
         
         # Verify the file belongs to the user (security check)
         expected_prefix = f"user_uploads/{user_id}/"
         if not file_path.startswith(expected_prefix):
             raise HTTPException(status_code=403, detail="Access denied: File does not belong to user")
-        
-        # Delete the file from Supabase storage
+
+        # First, check if file exists
         try:
-            storage_response = supabase.storage.from_("pdfs").remove([file_path])
+            storage_list = supabase_admin.storage.from_("pdfs").list(f"user_uploads/{user_id}")
+            print(f"Files before deletion: {storage_list}")
+        except Exception as list_error:
+            print(f"Could not list files: {list_error}")
+        
+        # Delete the file from Supabase storage using service role for admin permissions
+        try:
+            # Use service role client for better permissions
+            storage_response = supabase_admin.storage.from_("pdfs").remove([file_path])
             print(f"Storage deletion response: {storage_response}")
             
             # Also remove from memory cache if it exists
             if file_path in uploaded_files:
                 del uploaded_files[file_path]
+                print(f"Removed {file_path} from memory cache")
+
+            # Verify deletion by listing files again
+            try:
+                storage_list_after = supabase_admin.storage.from_("pdfs").list(f"user_uploads/{user_id}")
+                print(f"Files after deletion: {storage_list_after}")
+            except Exception as list_error:
+                print(f"Could not list files after deletion: {list_error}")
                 
         except Exception as storage_error:
             print(f"Error deleting file from storage: {storage_error}")
-            raise HTTPException(status_code=500, detail=f"Failed to delete file from storage: {storage_error}")
+            # Try with regular client as fallback
+            try:
+                storage_response = supabase.storage.from_("pdfs").remove([file_path])
+                print(f"Fallback deletion response: {storage_response}")
+            except Exception as fallback_error:
+                print(f"Fallback deletion also failed: {fallback_error}")
+                raise HTTPException(status_code=500, detail=f"Failed to delete file from storage: {storage_error}")
         
         return {"status": "success", "message": "PDF deleted successfully"}
         
